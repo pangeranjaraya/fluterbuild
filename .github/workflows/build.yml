@@ -1,0 +1,204 @@
+name: Web2APK Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Website URL (kosongkan jika memakai ZIP Flutter)"
+        required: false
+        type: string
+      zip_url:
+        description: "URL unduhan ZIP Flutter dari Telegram"
+        required: false
+        type: string
+      app_name:
+        description: "Nama aplikasi"
+        required: true
+        type: string
+      package_name:
+        description: "Application ID Android"
+        required: true
+        type: string
+      user_id:
+        description: "Telegram user ID penerima APK"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Prepare Flutter project from ZIP
+        if: ${{ inputs.zip_url != '' }}
+        shell: bash
+        env:
+          ZIP_URL: ${{ inputs.zip_url }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/source"
+          curl --fail --location --retry 3 --connect-timeout 30 "$ZIP_URL" -o "$RUNNER_TEMP/project.zip"
+          unzip -q "$RUNNER_TEMP/project.zip" -d "$RUNNER_TEMP/source"
+          PUBSPEC="$(find "$RUNNER_TEMP/source" -name pubspec.yaml -type f -print -quit)"
+          if [ -z "$PUBSPEC" ]; then
+            echo "::error::ZIP tidak berisi project Flutter (pubspec.yaml tidak ditemukan)."
+            exit 1
+          fi
+          PROJECT_DIR="$(dirname "$PUBSPEC")"
+          mkdir -p "$GITHUB_WORKSPACE/flutter_project"
+          cp -a "$PROJECT_DIR"/. "$GITHUB_WORKSPACE/flutter_project"/
+
+      - name: Create WebView project from URL
+        if: ${{ inputs.zip_url == '' && inputs.url != '' }}
+        shell: bash
+        env:
+          WEBSITE_URL: ${{ inputs.url }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$WEBSITE_URL" =~ ^https?:// ]]; then
+            echo "::error::URL harus diawali http:// atau https://"
+            exit 1
+          fi
+          flutter create --project-name web2apk_app --org com.web2apk "$GITHUB_WORKSPACE/flutter_project"
+          cd "$GITHUB_WORKSPACE/flutter_project"
+          flutter pub add webview_flutter
+          cat > lib/main.dart <<'DART'
+          import 'package:flutter/material.dart';
+          import 'package:webview_flutter/webview_flutter.dart';
+
+          void main() => runApp(const Web2ApkApp());
+
+          class Web2ApkApp extends StatelessWidget {
+            const Web2ApkApp({super.key});
+
+            @override
+            Widget build(BuildContext context) {
+              const websiteUrl = String.fromEnvironment('WEBSITE_URL');
+              final controller = WebViewController()
+                ..setJavaScriptMode(JavaScriptMode.unrestricted)
+                ..loadRequest(Uri.parse(websiteUrl));
+              return MaterialApp(
+                debugShowCheckedModeBanner: false,
+                title: 'Web2APK',
+                theme: ThemeData(useMaterial3: true),
+                home: Scaffold(
+                  body: SafeArea(child: WebViewWidget(controller: controller)),
+                ),
+              );
+            }
+          }
+          DART
+
+      - name: Validate project and set Android package ID
+        shell: bash
+        env:
+          PACKAGE_NAME: ${{ inputs.package_name }}
+          WEBSITE_URL: ${{ inputs.url }}
+          ZIP_URL: ${{ inputs.zip_url }}
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/flutter_project"
+          test -f pubspec.yaml || {
+            echo "::error::Project Flutter tidak ditemukan."
+            exit 1
+          }
+          python3 - <<'PY'
+          import os, re, pathlib
+          package = os.environ["PACKAGE_NAME"]
+          for filename in ("android/app/build.gradle", "android/app/build.gradle.kts"):
+              path = pathlib.Path(filename)
+              if not path.exists():
+                  continue
+              content = path.read_text()
+              if filename.endswith(".kts"):
+                  content = re.sub(r'applicationId\s*=\s*"[^"]+"', f'applicationId = "{package}"', content)
+                  content = re.sub(r'namespace\s*=\s*"[^"]+"', f'namespace = "{package}"', content)
+              else:
+                  content = re.sub(r'applicationId\s+"[^"]+"', f'applicationId "{package}"', content)
+                  content = re.sub(r'namespace\s+"[^"]+"', f'namespace "{package}"', content)
+              path.write_text(content)
+          PY
+
+      - name: Build release APK
+        shell: bash
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+          WEBSITE_URL: ${{ inputs.url }}
+          ZIP_URL: ${{ inputs.zip_url }}
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/flutter_project"
+          flutter pub get
+          if [ -n "$WEBSITE_URL" ] && [ -z "$ZIP_URL" ]; then
+            flutter build apk --release --dart-define="WEBSITE_URL=$WEBSITE_URL"
+          else
+            flutter build apk --release
+          fi
+          APK_PATH="build/app/outputs/flutter-apk/app-release.apk"
+          test -s "$APK_PATH" || {
+            echo "::error::APK release tidak ditemukan."
+            exit 1
+          }
+          SAFE_NAME="$(printf '%s' "$APP_NAME" | tr -cd 'a-zA-Z0-9_-')"
+          cp "$APK_PATH" "$GITHUB_WORKSPACE/${SAFE_NAME:-app}.apk"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: web2apk-${{ github.run_number }}
+          path: "*.apk"
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Send real APK to Telegram
+        if: ${{ success() }}
+        shell: bash
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_USER_ID: ${{ inputs.user_id }}
+          APP_NAME: ${{ inputs.app_name }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ]; then
+            echo "::error::Secret TELEGRAM_BOT_TOKEN belum diatur."
+            exit 1
+          fi
+          APK_FILE="$(find "$GITHUB_WORKSPACE" -maxdepth 1 -type f -name '*.apk' -print -quit)"
+          test -n "$APK_FILE"
+          curl --fail --silent --show-error \
+            -F "chat_id=$TELEGRAM_USER_ID" \
+            -F "document=@$APK_FILE" \
+            -F "caption=Build APK berhasil: $APP_NAME" \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument"
+
+      - name: Notify Telegram if build failed
+        if: ${{ failure() }}
+        shell: bash
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_USER_ID: ${{ inputs.user_id }}
+        run: |
+          if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_USER_ID:-}" ]; then
+            curl --silent --show-error \
+              -F "chat_id=$TELEGRAM_USER_ID" \
+              -F "text=Build APK gagal. Buka tab Actions di repository GitHub untuk melihat log error lengkap." \
+              "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" || true
+          fi
